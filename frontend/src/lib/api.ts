@@ -44,3 +44,17 @@ export const apiPut = <T>(path: string, body?: JsonBody) => request<T>("PUT", pa
 export const apiPatch = <T>(path: string, body?: JsonBody) =>
   request<T>("PATCH", path, body ?? null);
 export const apiDelete = <T>(path: string) => request<T>("DELETE", path);
+
+export async function apiPostStream(path: string, body: JsonBody): Promise<ReadableStream<Uint8Array>> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => null);
+    throw new ApiError(res.status, errBody);
+  }
+  if (!res.body) throw new ApiError(502, { detail: "stream unavailable" });
+  return res.body;
+}

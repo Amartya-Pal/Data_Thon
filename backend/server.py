@@ -7,6 +7,7 @@ import os
 import logging
 from pathlib import Path
 from routers.dashboard import router as dashboard_router
+from routers.ai import router as ai_router
 
 
 ROOT_DIR = Path(__file__).parent
@@ -30,6 +31,7 @@ app = FastAPI(lifespan=lifespan)
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 api_router.include_router(dashboard_router)
+api_router.include_router(ai_router)
 
 
 # Include the router in the main app

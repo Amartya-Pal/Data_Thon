@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
+  AlertTriangle,
   ArrowDownRight,
   ArrowUpRight,
   BarChart3,
@@ -12,7 +13,10 @@ import {
   MapPinned,
   RefreshCw,
   Route,
+  Send,
+  ShieldCheck,
   Sprout,
+  Sparkles,
   Truck,
   TrendingDown,
   TrendingUp,
@@ -41,7 +45,7 @@ import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { apiGet } from "@/lib/api";
+import { apiGet, apiPostStream } from "@/lib/api";
 
 interface DashboardMetrics {
   total_arrivals: number;
@@ -114,6 +118,17 @@ interface DashboardData {
   destinations: DestinationPoint[];
   latest_arrivals: LatestArrival[];
   filters: DashboardFilters;
+}
+
+interface AiStreamEvent {
+  type: "delta" | "done" | "error";
+  content?: string | null;
+}
+
+interface AiQueryRequest {
+  question: string;
+  session_id: string;
+  context: Record<string, unknown>;
 }
 
 interface DashboardFilterState {
@@ -227,6 +242,13 @@ function ChartHeader({ eyebrow, title, detail, icon: Icon }: { eyebrow: string; 
 
 export default function Home() {
   const [filters, setFilters] = useState<DashboardFilterState>({ crop: "", state: "", mandi: "", dateFrom: "", dateTo: "" });
+  const [rainfallThreshold, setRainfallThreshold] = useState(1300);
+  const [humidityThreshold, setHumidityThreshold] = useState(70);
+  const [question, setQuestion] = useState("");
+  const [answer, setAnswer] = useState("");
+  const [answerFacts, setAnswerFacts] = useState<string[]>([]);
+  const [isAsking, setIsAsking] = useState(false);
+  const [sessionId] = useState(() => `field-pulse-${Math.random().toString(36).slice(2)}`);
   const query = useQuery({
     queryKey: ["dashboard-summary", filters],
     queryFn: () => fetchDashboard(filters),
@@ -238,6 +260,19 @@ export default function Home() {
   const hasFilters = Object.values(filters).some(Boolean);
   const filterCount = Object.values(filters).filter(Boolean).length;
   const maxCropQuantity = useMemo(() => Math.max(...(data?.crops.map((item) => item.quantity_qtl) ?? [1])), [data?.crops]);
+  const weatherAlerts = useMemo(
+    () => (data?.trend ?? []).filter((point) => (point.rainfall_mm ?? 0) >= rainfallThreshold || (point.humidity_pct ?? 0) >= humidityThreshold).slice(-5).reverse(),
+    [data?.trend, humidityThreshold, rainfallThreshold],
+  );
+  const aiContext = useMemo(() => ({
+    scope: filters,
+    metrics: data?.metrics,
+    crops: data?.crops,
+    mandis: data?.mandis.slice(0, 6),
+    destinations: data?.destinations,
+    recent_periods: data?.trend.slice(-6),
+    weather_alerts: weatherAlerts,
+  }), [data, filters, weatherAlerts]);
 
   const updateFilter = (key: keyof DashboardFilterState, value: string) => {
     setFilters((current) => ({ ...current, [key]: value }));
@@ -251,6 +286,50 @@ export default function Home() {
   const refresh = async () => {
     await query.refetch();
     toast.success("Dashboard data refreshed");
+  };
+
+  const askAgent = async (preset?: string) => {
+    const prompt = (preset ?? question).trim();
+    if (!prompt || isAsking) return;
+    setQuestion(prompt);
+    setAnswer("");
+    setAnswerFacts([]);
+    setIsAsking(true);
+    try {
+      const payload: AiQueryRequest = { question: prompt, session_id: sessionId, context: aiContext };
+      const stream = await apiPostStream("/ai/query", payload);
+      const reader = stream.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let finalAnswer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split("\n\n");
+        buffer = events.pop() ?? "";
+        for (const rawEvent of events) {
+          const line = rawEvent.split("\n").find((entry) => entry.startsWith("data: "));
+          if (!line) continue;
+          const event = JSON.parse(line.slice(6)) as AiStreamEvent;
+          if (event.type === "delta" && event.content) {
+            finalAnswer += event.content;
+            setAnswer(finalAnswer);
+          }
+          if (event.type === "error") throw new Error(event.content ?? "Agent unavailable");
+        }
+      }
+      setAnswerFacts([
+        `${formatNumber(metrics?.total_arrivals)} arrivals in scope`,
+        `${data?.crops.length ?? 0} crops represented`,
+        `${weatherAlerts.length} weather-risk periods flagged`,
+      ]);
+      toast.success("Field/Pulse answered from the active scope");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Agent unavailable right now");
+    } finally {
+      setIsAsking(false);
+    }
   };
 
   return (
@@ -369,6 +448,28 @@ export default function Home() {
           <Card className="surface-card climate-card" data-testid="climate-signal-card">
             <ChartHeader icon={Droplets} eyebrow="Climate signal" title="Weather context" detail="Rainfall and humidity across the same periods" />
             <CardContent className="chart-content"><div className="climate-stat-row"><div><span>Avg humidity</span><strong>{formatNumber(data?.trend.length ? data.trend[data.trend.length - 1].humidity_pct : null, 1)}<small>%</small></strong></div><div><span>Rainfall index</span><strong>{formatNumber(data?.trend.length ? data.trend[data.trend.length - 1].rainfall_mm : null, 0)}<small> mm</small></strong></div></div><div className="chart-frame compact-chart" data-testid="climate-signal-chart"><ResponsiveContainer width="100%" height={145}><AreaChart data={data?.trend ?? []} margin={{ top: 8, right: 2, bottom: 0, left: -28 }}><defs><linearGradient id="rainFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#3B82F6" stopOpacity={0.3} /><stop offset="100%" stopColor="#3B82F6" stopOpacity={0} /></linearGradient></defs><CartesianGrid stroke="#1F2E23" strokeDasharray="2 5" vertical={false} /><XAxis dataKey="period" hide /><YAxis hide /><Tooltip contentStyle={{ background: "#121A14", border: "1px solid #2C4433", borderRadius: 2, color: "#F8FAF9", fontSize: 12 }} formatter={(value: number) => [`${formatNumber(value)} mm`, "Rainfall"]} /><Area type="monotone" dataKey="rainfall_mm" stroke="#3B82F6" fill="url(#rainFill)" strokeWidth={1.5} isAnimationActive animationDuration={1200} /></AreaChart></ResponsiveContainer></div></CardContent>
+          </Card>
+        </section>
+
+        <section className="insight-grid" data-testid="insight-tools">
+          <Card className="surface-card alert-card" data-testid="weather-alerts-card">
+            <CardHeader className="chart-header">
+              <div className="flex items-start justify-between gap-4"><div><div className="section-eyebrow"><AlertTriangle size={13} /> Risk watch</div><CardTitle className="chart-title">Weather alerts</CardTitle><p className="chart-detail">Thresholds that can slow the next logistics leg</p></div><span className={`alert-count ${weatherAlerts.length ? "is-risk" : "is-clear"}`} data-testid="weather-alert-count">{weatherAlerts.length ? `${weatherAlerts.length} flagged` : "Clear"}</span></div>
+            </CardHeader>
+            <CardContent className="chart-content">
+              <div className="threshold-grid"><label data-testid="rainfall-threshold-field"><span>Rainfall trigger</span><div><input data-testid="rainfall-threshold-input" type="number" min="0" step="25" value={rainfallThreshold} onChange={(event) => setRainfallThreshold(Number(event.target.value) || 0)} /><small>mm</small></div></label><label data-testid="humidity-threshold-field"><span>Humidity trigger</span><div><input data-testid="humidity-threshold-input" type="number" min="0" max="100" step="1" value={humidityThreshold} onChange={(event) => setHumidityThreshold(Number(event.target.value) || 0)} /><small>%</small></div></label></div>
+              <div className="alert-list" data-testid="weather-alert-list">{weatherAlerts.length ? weatherAlerts.map((alert) => <div className="alert-row" key={alert.period}><span className="alert-icon"><AlertTriangle size={14} /></span><div><strong>{formatShortDate(alert.period)} / Elevated conditions</strong><span>{(alert.rainfall_mm ?? 0) >= rainfallThreshold ? `${formatNumber(alert.rainfall_mm, 0)} mm rain` : "Rainfall normal"} · {(alert.humidity_pct ?? 0) >= humidityThreshold ? `${formatNumber(alert.humidity_pct, 1)}% humidity` : "Humidity normal"}</span></div><Badge variant="outline">Watch</Badge></div>) : <div className="clear-alert"><span className="clear-icon">✓</span><div><strong>No elevated weather signal</strong><span>Current periods sit below both logistics thresholds.</span></div></div>}</div>
+            </CardContent>
+          </Card>
+
+          <Card className="surface-card ai-card" data-testid="ai-agent-card">
+            <CardHeader className="chart-header"><div className="flex items-start justify-between gap-4"><div><div className="section-eyebrow"><Sparkles size={13} /> Field/Pulse analyst</div><CardTitle className="chart-title">Ask the dataset</CardTitle><p className="chart-detail">Answers are grounded in the active dashboard scope.</p></div><span className="agent-status"><span className="status-dot small" /> READY</span></div></CardHeader>
+            <CardContent className="chart-content ai-content">
+              <div className="suggestion-row" data-testid="ai-suggestions"><button type="button" data-testid="ai-suggestion-volume-button" onClick={() => void askAgent("Which crop is driving the most volume right now?")}>Top volume crop</button><button type="button" data-testid="ai-suggestion-risk-button" onClick={() => void askAgent("Where should the logistics team look first for risk?")}>Find risk nodes</button></div>
+              <div className="ai-answer" data-testid="ai-answer"><div className="ai-answer-top"><span className="ai-spark"><Sparkles size={13} /></span><span>{isAsking ? "Reading the current scope…" : answer ? "Current scope analysis" : "Ask a precise question"}</span></div>{answer ? <p>{answer}</p> : <p className="ai-placeholder">Try “Which market has the highest volume?” or “How exposed are arrivals to below-MSP pricing?”</p>}{isAsking && <span className="typing-caret" />}{answerFacts.length > 0 && <div className="answer-facts">{answerFacts.map((fact) => <span key={fact}>· {fact}</span>)}</div>}</div>
+              <form className="ai-form" onSubmit={(event) => { event.preventDefault(); void askAgent(); }}><input data-testid="ai-question-input" value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Ask about crops, markets, price, or logistics…" /><Button type="submit" size="icon" data-testid="ai-question-submit-button" disabled={!question.trim() || isAsking}><Send size={15} /></Button></form>
+              <div className="ai-footnote"><ShieldCheck size={13} /> Grounded in {formatNumber(metrics?.total_arrivals)} source records · Private server-side key</div>
+            </CardContent>
           </Card>
         </section>
 

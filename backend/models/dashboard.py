@@ -59,9 +59,45 @@ class LatestArrival(BaseModel):
     destination: str
 
 
+class MspCropPoint(BaseModel):
+    crop: str
+    msp: float | None
+    avg_modal: float | None
+    gap_pct: float | None
+    below_msp_pct: float | None
+    priced_records: int
+
+
+class FixSample(BaseModel):
+    arrival_id: str
+    raw: str
+    cleaned: str
+
+
+class QualityRule(BaseModel):
+    rule: str
+    label: str
+    description: str
+    count: int
+    samples: List[FixSample]
+
+
+class DataQualityReport(BaseModel):
+    raw_rows: int
+    clean_rows: int
+    dropped_rows: int
+    rows_touched: int
+    total_fixes: int
+    quality_score: float
+    anchor_date: str
+    noise_rate_pct: float
+    rules: List[QualityRule]
+
+
 class DashboardFilters(BaseModel):
     crops: List[str]
     states: List[str]
+    districts: List[str]
     mandis: List[str]
     date_min: date
     date_max: date
@@ -74,4 +110,38 @@ class DashboardResponse(BaseModel):
     mandis: List[MandiPerformance]
     destinations: List[DestinationPoint]
     latest_arrivals: List[LatestArrival]
+    msp_watch: List[MspCropPoint]
+    data_quality: DataQualityReport
     filters: DashboardFilters
+
+
+class SeriesPoint(BaseModel):
+    date: str
+    quantity_qtl: float
+    arrivals: int
+    avg_modal: float | None
+    rolling_modal: float | None
+    msp: float | None
+
+
+class SeriesSummary(BaseModel):
+    total_quantity_qtl: float
+    total_arrivals: int
+    avg_modal: float | None
+    priced_days: int
+    days_below_msp: int
+    peak_date: str | None
+    peak_quantity_qtl: float
+
+
+class SeriesResponse(BaseModel):
+    title: str
+    crop: str | None
+    location: str
+    location_kind: str
+    days: int
+    start_date: str
+    end_date: str
+    msp: float | None
+    points: List[SeriesPoint]
+    summary: SeriesSummary

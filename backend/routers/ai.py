@@ -7,13 +7,15 @@ from fastapi.responses import StreamingResponse
 from emergentintegrations.llm.chat import LlmChat, StreamDone, TextDelta, UserMessage
 
 from lib.db import db
-from models.ai import AiQueryRequest, AiStreamEvent
+from lib.dataset import build_series, get_dataset, parse_chart_intent
+from models.ai import AiQueryRequest, AiStreamEvent, ChartIntent
+from models.dashboard import SeriesResponse
 
 router = APIRouter(prefix="/ai", tags=["ai"])
 
 
-def _event(event_type: str, content: str | None = None) -> str:
-    return f"data: {AiStreamEvent(type=event_type, content=content).model_dump_json()}\n\n"
+def _event(event_type: str, content: str | None = None, chart: SeriesResponse | None = None, intent: ChartIntent | None = None) -> str:
+    return f"data: {AiStreamEvent(type=event_type, content=content, chart=chart, intent=intent).model_dump_json()}\n\n"
 
 
 @router.post("/query")
@@ -22,36 +24,55 @@ async def query_dashboard_agent(request: AiQueryRequest):
     if not api_key:
         raise HTTPException(status_code=503, detail="AI agent is not configured")
 
+    rows, _ = await get_dataset()
+    intent_dict = parse_chart_intent(request.question, rows)
+    chart: SeriesResponse | None = None
+    intent: ChartIntent | None = None
+    if intent_dict:
+        intent = ChartIntent(**intent_dict)
+        chart = build_series(rows, intent.crop, intent.location, intent.location_kind, intent.days)
+
     now = datetime.now(timezone.utc)
     await db.ai_chat_history.insert_one({
         "session_id": request.session_id,
         "role": "user",
         "content": request.question,
+        "chart_intent": intent.model_dump() if intent else None,
         "created_at": now,
     })
 
-    context_json = json.dumps(request.context, ensure_ascii=False, default=str)
+    context: dict = {"dashboard": request.context}
+    if chart:
+        context["plotted_series"] = {
+            "title": chart.title,
+            "window": f"{chart.start_date} to {chart.end_date}",
+            "msp": chart.msp,
+            "summary": chart.summary.model_dump(),
+            "daily_points": [
+                {"date": p.date, "qtl": p.quantity_qtl, "arrivals": p.arrivals, "modal": p.avg_modal}
+                for p in chart.points if p.arrivals
+            ],
+        }
+    context_json = json.dumps(context, ensure_ascii=False, default=str)
     system_message = (
-        "You are Field/Pulse, a precise agritech operations analyst. Answer only from the supplied "
-        "dashboard context. Never invent values, records, weather, or recommendations. If the context "
-        "does not answer the question, say that clearly and suggest a better dataset question. Keep answers "
-        "concise: lead with the conclusion, then use short bullets for evidence. Use Indian number formatting "
-        "when helpful. Mention the active filter scope when relevant."
+        "You are Mandi/Pulse, a precise supply-chain analyst for a State Agriculture Board. Answer only from "
+        "the supplied context (dashboard scope and, when present, the plotted_series that has ALREADY been "
+        "rendered as a chart for the user). Never invent values, records, weather, or recommendations. "
+        "If a chart was plotted, open with one line confirming what is on the chart, then interpret it: "
+        "arrival trend, price vs MSP, and any gaps in reported prices. If the context does not answer the "
+        "question, say so clearly and suggest a better dataset question. Keep answers concise: lead with the "
+        "conclusion, then 2-4 short bullets of evidence. Use Indian number formatting and ₹ for prices. "
+        "Quantities are in quintals (qtl)."
     )
-    prompt = f"Dashboard context (JSON):\n{context_json}\n\nUser question:\n{request.question}"
+    prompt = f"Context (JSON):\n{context_json}\n\nUser question:\n{request.question}"
 
     async def stream_answer():
         answer_parts: list[str] = []
         try:
-            chat = (
-                LlmChat(
-                    api_key=api_key,
-                    session_id=request.session_id,
-                    system_message=system_message,
-                )
-                .with_model("openai", "gpt-5.4")
-            )
-            async for event in chat.stream_message(UserMessage(text=prompt)):
+            if chart:
+                yield _event("chart", chart=chart, intent=intent)
+            llm = LlmChat(api_key=api_key, session_id=request.session_id, system_message=system_message).with_model("openai", "gpt-5.4")
+            async for event in llm.stream_message(UserMessage(text=prompt)):
                 if isinstance(event, TextDelta):
                     answer_parts.append(event.content)
                     yield _event("delta", event.content)
@@ -66,7 +87,7 @@ async def query_dashboard_agent(request: AiQueryRequest):
             })
             yield _event("done")
         except Exception:
-            yield _event("error", "The field analyst is unavailable right now. Please try again.")
+            yield _event("error", "The mandi analyst is unavailable right now. Please try again.")
 
     return StreamingResponse(
         stream_answer(),
